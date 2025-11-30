@@ -7,6 +7,8 @@ import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.List;
 
 @Service
@@ -16,26 +18,48 @@ public class BidService {
     private final BidRepository bidRepository;
     private final ItemRepository itemRepository;
 
+    // Use the same fixed zone as ItemService
+    private static final ZoneId AUCTION_ZONE = ZoneId.of("America/Toronto");
+
+    private void refreshStatusIfNeeded(ItemEntity item) {
+        if (item == null) return;
+        if (!"ACTIVE".equalsIgnoreCase(item.getStatus())) {
+            return;
+        }
+        var endTime = item.getEndTime();
+        if (endTime == null) {
+            return;
+        }
+        ZonedDateTime end = endTime.atZone(AUCTION_ZONE);
+        ZonedDateTime now = ZonedDateTime.now(AUCTION_ZONE);
+        if (!end.isAfter(now)) {
+            item.setStatus("ENDED");
+            itemRepository.save(item);
+        }
+    }
+
     public BidResponse placeBid(Long itemId, BidRequest request) {
         ItemEntity item = itemRepository.findById(itemId)
             .orElseThrow(() -> new IllegalArgumentException("Item not found"));
+
+        refreshStatusIfNeeded(item);
 
         if (!"FORWARD".equalsIgnoreCase(item.getAuctionType())) {
             throw new IllegalArgumentException("Bidding is only allowed on FORWARD auctions");
         }
 
-        // 🔹 If already ended → no more bids
         if (!"ACTIVE".equalsIgnoreCase(item.getStatus())) {
             throw new IllegalArgumentException("Auction is not active");
         }
 
-        // 🔹 If end_time passed, mark ended and reject
-        if (item.getEndTime() != null && LocalDateTime.now().isAfter(item.getEndTime())) {
-            item.setStatus("ENDED");
-            itemRepository.save(item);
-            throw new IllegalArgumentException("Auction has ended");
+        if (item.getEndTime() != null) {
+            LocalDateTime nowToronto = ZonedDateTime.now(AUCTION_ZONE).toLocalDateTime();
+            if (nowToronto.isAfter(item.getEndTime())) {
+                item.setStatus("ENDED");
+                itemRepository.save(item);
+                throw new IllegalArgumentException("Auction has ended");
+            }
         }
-
 
         if (request.bidderId() == null) {
             throw new IllegalArgumentException("bidderId is required");

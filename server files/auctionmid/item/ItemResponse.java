@@ -3,8 +3,11 @@ package com.aurora.auctionmid.item;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
+/**
+ * Response DTO for exposing item data to the front-end.
+ */
 public record ItemResponse(
-        Long id,
+        Long itemId,
         Long sellerId,
         String title,
         String description,
@@ -15,5 +18,15 @@ public record ItemResponse(
         String status,
         Long currentWinnerId,
         LocalDateTime createdAt,
-        LocalDateTime endTime
+        LocalDateTime endTime,
+
+        // Extra descriptive / shipping fields
+        String conditionCode,
+        String coverImageUrl,
+        BigDecimal shipCostStd,
+        BigDecimal shipCostExp,
+        Integer shipDays,
+        String category,
+        String keywords,
+        Integer quantity
 ) {}

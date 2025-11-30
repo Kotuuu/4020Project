@@ -8,6 +8,8 @@ import org.springframework.stereotype.Service;
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.List;
 
 @Service
@@ -17,23 +19,56 @@ public class ItemService {
     private final ItemRepository itemRepository;
     private final UserRepository userRepository;
 
+    // 🔹 All auction timing logic uses this fixed zone
+    private static final ZoneId AUCTION_ZONE = ZoneId.of("America/Toronto");
+
+    /**
+     * Ensure the item's status matches its endTime using AUCTION_ZONE.
+     * If status is ACTIVE and endTime <= now → flip to ENDED and save.
+     */
+    private void refreshStatusIfNeeded(ItemEntity item) {
+        if (item == null) return;
+        if (!"ACTIVE".equalsIgnoreCase(item.getStatus())) {
+            return;
+        }
+        LocalDateTime endTime = item.getEndTime();
+        if (endTime == null) {
+            return;
+        }
+
+        ZonedDateTime end = endTime.atZone(AUCTION_ZONE);
+        ZonedDateTime now = ZonedDateTime.now(AUCTION_ZONE);
+
+        if (!end.isAfter(now)) {
+            item.setStatus("ENDED");
+            itemRepository.save(item);
+        }
+    }
+
     public List<ItemResponse> listAllItems() {
         return itemRepository.findAll()
                 .stream()
+                .peek(this::refreshStatusIfNeeded)
                 .map(this::toResponse)
                 .toList();
     }
 
     public List<ItemResponse> listActiveItems() {
-        return itemRepository.findByStatus("ACTIVE")
-                .stream()
+        List<ItemEntity> items = itemRepository.findByStatus("ACTIVE");
+        items.forEach(this::refreshStatusIfNeeded);
+
+        return items.stream()
+                .filter(i -> "ACTIVE".equalsIgnoreCase(i.getStatus()))
                 .map(this::toResponse)
                 .toList();
     }
 
     public List<ItemResponse> listEndedItems() {
-        return itemRepository.findByStatus("ENDED")
-                .stream()
+        List<ItemEntity> all = itemRepository.findAll();
+        all.forEach(this::refreshStatusIfNeeded);
+
+        return all.stream()
+                .filter(i -> "ENDED".equalsIgnoreCase(i.getStatus()))
                 .map(this::toResponse)
                 .toList();
     }
@@ -53,17 +88,47 @@ public class ItemService {
                 ? request.auctionType().toUpperCase()
                 : "FORWARD";
 
+        // ----- Defaults for extra fields -----
+        String conditionCode = request.conditionCode() != null
+                ? request.conditionCode().toUpperCase()
+                : "USED";
+
+        BigDecimal shipCostStd = request.shipCostStd() != null
+                ? request.shipCostStd()
+                : BigDecimal.ZERO;
+
+        BigDecimal shipCostExp = request.shipCostExp() != null
+                ? request.shipCostExp()
+                : BigDecimal.ZERO;
+
+        Integer shipDays = request.shipDays() != null
+                ? request.shipDays()
+                : 5;
+
+        Integer quantity = request.quantity() != null
+                ? request.quantity()
+                : 1;
+
+        // ----- Build and save entity -----
         ItemEntity entity = ItemEntity.builder()
                 .sellerId(request.sellerId())
                 .title(request.title())
                 .description(request.description())
+                .conditionCode(conditionCode)
+                .coverImageUrl(request.coverImageUrl())
+                .shipCostStd(shipCostStd)
+                .shipCostExp(shipCostExp)
+                .shipDays(shipDays)
                 .startingPrice(request.startingPrice())
                 .currentPrice(request.startingPrice())
                 .minimumPrice(request.minimumPrice())
                 .auctionType(auctionType)
                 .status("ACTIVE")
                 .endTime(request.endTime())
-                .paymentStatus("UNPAID")   // 🔹 new: all new auctions start UNPAID
+                .category(request.category())
+                // keywords not collected from UI right now – leave null
+                .quantity(quantity)
+                .paymentStatus("UNPAID")
                 .build();
 
         ItemEntity saved = itemRepository.save(entity);
@@ -78,6 +143,8 @@ public class ItemService {
         List<ItemEntity> results = itemRepository
                 .findByTitleContainingIgnoreCaseOrDescriptionContainingIgnoreCase(query, query);
 
+        results.forEach(this::refreshStatusIfNeeded);
+
         return results.stream()
                 .map(this::toResponse)
                 .toList();
@@ -86,12 +153,17 @@ public class ItemService {
     public ItemResponse getItem(Long itemId) {
         ItemEntity entity = itemRepository.findById(itemId)
                 .orElseThrow(() -> new IllegalArgumentException("Item not found"));
+
+        refreshStatusIfNeeded(entity);
+
         return toResponse(entity);
     }
 
     public ItemResponse endAuction(Long itemId) {
         ItemEntity item = itemRepository.findById(itemId)
                 .orElseThrow(() -> new IllegalArgumentException("Item not found"));
+
+        refreshStatusIfNeeded(item);
 
         if ("ENDED".equalsIgnoreCase(item.getStatus())) {
             return toResponse(item);
@@ -101,6 +173,8 @@ public class ItemService {
         ItemEntity saved = itemRepository.save(item);
         return toResponse(saved);
     }
+
+    // ---- Dutch pricing ----
 
     public BigDecimal calculateCurrentDutchPrice(ItemEntity item, LocalDateTime now) {
         if (!"DUTCH".equalsIgnoreCase(item.getAuctionType())) {
@@ -125,12 +199,10 @@ public class ItemService {
         }
 
         double fraction = (double) elapsed.toMillis() / (double) total.toMillis();
-
         BigDecimal drop = start.subtract(min)
                 .multiply(BigDecimal.valueOf(fraction));
 
         BigDecimal current = start.subtract(drop);
-
         if (current.compareTo(min) < 0) {
             current = min;
         }
@@ -145,12 +217,15 @@ public class ItemService {
             throw new IllegalArgumentException("Not a Dutch auction");
         }
 
-        return calculateCurrentDutchPrice(item, LocalDateTime.now());
+        LocalDateTime nowToronto = ZonedDateTime.now(AUCTION_ZONE).toLocalDateTime();
+        return calculateCurrentDutchPrice(item, nowToronto);
     }
 
     public ItemResponse acceptDutch(Long itemId, Long buyerId) {
         ItemEntity item = itemRepository.findById(itemId)
                 .orElseThrow(() -> new IllegalArgumentException("Item not found"));
+
+        refreshStatusIfNeeded(item);
 
         if (!"DUTCH".equalsIgnoreCase(item.getAuctionType())) {
             throw new IllegalArgumentException("Not a Dutch auction");
@@ -162,13 +237,14 @@ public class ItemService {
             throw new IllegalArgumentException("buyerId is required");
         }
 
-        if (item.getEndTime() != null && LocalDateTime.now().isAfter(item.getEndTime())) {
+        LocalDateTime nowToronto = ZonedDateTime.now(AUCTION_ZONE).toLocalDateTime();
+        if (item.getEndTime() != null && nowToronto.isAfter(item.getEndTime())) {
             item.setStatus("ENDED");
             itemRepository.save(item);
             throw new IllegalArgumentException("Auction has ended");
         }
 
-        BigDecimal price = calculateCurrentDutchPrice(item, LocalDateTime.now());
+        BigDecimal price = calculateCurrentDutchPrice(item, nowToronto);
 
         item.setCurrentPrice(price);
         item.setStatus("ENDED");
@@ -179,7 +255,7 @@ public class ItemService {
     }
 
     /**
-     * Simulate payment for an item.
+     * Simulate payment for an item:
      * - Auction must be ENDED
      * - There must be a winner
      * - payerId must match currentWinnerId
@@ -188,6 +264,8 @@ public class ItemService {
     public ReceiptResponse payForItem(Long itemId, PaymentRequest request) {
         ItemEntity item = itemRepository.findById(itemId)
                 .orElseThrow(() -> new IllegalArgumentException("Item not found"));
+
+        refreshStatusIfNeeded(item);
 
         if (!"ENDED".equalsIgnoreCase(item.getStatus())) {
             throw new IllegalArgumentException("Auction has not ended yet");
@@ -206,22 +284,21 @@ public class ItemService {
         }
 
         if ("PAID".equalsIgnoreCase(item.getPaymentStatus())) {
-            // Already paid, just return receipt
             return getReceipt(itemId);
         }
 
-        // At this point, we "accept" the payment with no real verification
         item.setPaymentStatus("PAID");
-        item.setPaymentTime(LocalDateTime.now());
+        item.setPaymentTime(ZonedDateTime.now(AUCTION_ZONE).toLocalDateTime());
         itemRepository.save(item);
 
-        // Return updated receipt
         return getReceipt(itemId);
     }
 
     public ReceiptResponse getReceipt(Long itemId) {
         ItemEntity item = itemRepository.findById(itemId)
                 .orElseThrow(() -> new IllegalArgumentException("Item not found"));
+
+        refreshStatusIfNeeded(item);
 
         if (!"ENDED".equalsIgnoreCase(item.getStatus())) {
             throw new IllegalArgumentException("Auction has not ended yet");
@@ -272,6 +349,8 @@ public class ItemService {
         );
     }
 
+    // ---- DTO mapping ----
+
     private ItemResponse toResponse(ItemEntity e) {
         return new ItemResponse(
                 e.getItemId(),
@@ -285,7 +364,15 @@ public class ItemService {
                 e.getStatus(),
                 e.getCurrentWinnerId(),
                 e.getCreatedAt(),
-                e.getEndTime()
+                e.getEndTime(),
+                e.getConditionCode(),
+                e.getCoverImageUrl(),
+                e.getShipCostStd(),
+                e.getShipCostExp(),
+                e.getShipDays(),
+                e.getCategory(),
+                e.getKeywords(),
+                e.getQuantity()
         );
     }
 }
